@@ -1,0 +1,578 @@
+---
+title: "Chikungunya no estado do Rio de Janeiro"
+author: Lucas Bianchi and Leo Bastos
+output:
+  html_document:
+    highlight: pygments
+    keep_md: yes
+    lib_dir: libs
+    mathjax: local
+    number_sections: yes
+    self_contained: no
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+editor_options:
+  chunk_output_type: console
+fig_caption: yes
+fig_height: 7
+fig_width: 7
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Lendo dados e carregando pacotes
+
+Para começar vamos ler dados de Chikungunya no estado do Rio de Janeiro por sexo e faixa etária. Os dados de casos notificados vem do SINAN, enquanto os dados populacionais vem de projeções do IBGE para o ano de 2015.
+
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+# Read csv
+library(tidyverse)
+library(lubridate)
+library(INLA)
+
+
+col.names <- c("id", "dt_notific", "se_notific",
+               "ano_notific", "dt_sin_pri",
+               "se_sin_pri", "dt_digita",
+               "bairro_nome", "bairro_id",
+               "mun_geocod", "nu_notific", 
+               "cid10", "dt_nasc", "sex",
+               "nu_idade_n")
+
+dadosRJ <- read_csv("../Data/rio_chik.csv", col_names = col.names ) %>% 
+  filter(substr(mun_geocod,start = 1, stop = 2) == "33",
+         sex != "I") %>% 
+  mutate(
+    epidate = as.Date(paste("7", se_notific, ano_notific, sep="-"), '%u-%U-%Y'),
+    mun_geocod = as.character(mun_geocod),
+    COD_MUN = substr(mun_geocod, start = 1, stop = 6),
+    AgeCat = cut(
+      nu_idade_n - 4000, 
+      breaks = c(0, 5, 10, 15, seq(20,80,by=10), Inf ),
+      right = F,
+      labels = c("0 a 4 anos", "05 a 9 anos",
+                 "10 a 14 anos", "15 a 19 anos", 
+                 "20 a 29 anos", "30 a 39 anos",  
+                 "40 a 49 anos", "50 a 59 anos",
+                 "60 a 69 anos", "70 a 79 anos",
+                 "80 anos e mais")
+      ),
+    AgeCat = as.character(AgeCat)
+    ) 
+
+
+
+dadosPOPRJ <- readODS::read_ods(path = "../Data/POP2015TCU/POP2015FaixaEtariaSexo.ods", 
+                       col_names = T) %>% 
+  gather(key = "AgeCat", value = "POP", -c(COD_MUN, Sex)) %>%
+  mutate(COD_MUN2 = COD_MUN,
+         COD_MUN = substr(COD_MUN, 1, 6))
+
+dadosRJ2016 <- dadosRJ %>% 
+  filter(!is.na(AgeCat), !is.na(sex), ano_notific == 2016) %>% 
+  group_by(COD_MUN, AgeCat, sex) %>% 
+  summarise(Y = n())
+
+
+dadosCHIKRJ <- dadosPOPRJ %>% 
+  left_join(dadosRJ2016, by = c("COD_MUN", "AgeCat", "Sex"="sex")) %>%
+  mutate(
+    Y = replace(x = Y, list = is.na(Y), values = 0 )
+  ) %>% rowid_to_column(var = "ID")
+
+CODMUN.tbl <- tibble(COD_MUN = unique(dadosCHIKRJ$COD_MUN)) %>% rowid_to_column("Mun") 
+
+dadosCHIKRJ <- dadosCHIKRJ %>% left_join(CODMUN.tbl, by = "COD_MUN")
+
+```
+
+
+
+## Incidências (baseadas em modelo)
+
+Seja $Y_{s,a,m}$ o número de casos de Chikungunya para o sexo $s$, faixa etária $a$, e no município $m$ de um determinado estado e para um período de tempo pré especificado, usualmente anual. Vamos supor que temos um modelo probabilístico $M$ que nos permita inferir um valor para $Y_{s,a,m}$ que vamos denotar por $\widetilde{Y}_{s,a,m}$.
+
+A incidência anual de Chikungunya no município $m$, para o sexo $s$ e faixa etária $a$, denotada por $I_{s,a,m}$,  é definida por 
+$$I_{s,a,m} = \frac{\widetilde{Y}_{s,a,m}}{POP_{s,a,m}} \times 10^5,$$
+onde $POP_{s,a,m}$ é o total de habitantes do município $m$ do sexo $s$ e faixa etária $a$. Diferentes escolhas para o modelo $M$ implicará em diferentes valores para $\widetilde{Y}_{s,a,m}$.
+
+
+Incidência geral de Chikungunya no estado é dada por
+
+$$I^{(estado)} = \frac{\sum_{s}\sum_{a}\sum_{m}I_{s,a,m} \times POP_{s,a,m}}{ \sum_{s}\sum_{a}\sum_{m} POP_{s,a,m} }.$$
+Note que a população do estado $POP^{(estado)} = \sum_{s}\sum_{a}\sum_{m} POP_{s,a,m}$ é o denominador da incidência do estado. E se o estimador de $\widetilde{Y}_{s,a,m} = y_{s,a,m}$ então a incidência do estado se resumo à incidência bruta, dada pelo total de casos no estado sobre a população do estado por 100 mil habitantes.
+
+
+Incidência específica de Chikungunya por sexo é dada por
+
+$$I^{(sexo)}_s = \frac{\sum_{a}\sum_{m}I_{s,a,m} \times POP_{s,a,m}}{ \sum_{a}\sum_{m} POP_{s,a,m} }.$$
+
+
+Incidência específica de Chikungunya por faixa etária é dada por
+
+$$I^{(FaEt)}_a = \frac{\sum_{s}\sum_{m}I_{s,a,m} \times POP_{s,a,m}}{ \sum_{s}\sum_{m} POP_{s,a,m} }.$$
+
+Incidência específica de Chikungunya por faixa etária e sexo é dada por
+
+$$I^{(SexoFaEt)}_{s,a} = \frac{\sum_{m}I_{s,a,m} \times POP_{s,a,m}}{ \sum_{m} POP_{s,a,m} }.$$
+
+Incidência específica de Chikungunya por município é dada por
+
+$$I^{(mun)}_m = \frac{\sum_{s}\sum_{a}I_{s,a,m} \times POP_{s,a,m}}{ \sum_{s}\sum_{a} POP_{s,a,m} }.$$
+
+
+
+```{r, echo = F}
+# Calculo bruto
+# sum(dadosCHIKRJ$Y) / sum(dadosCHIKRJ$POP) * 10^5
+
+# Model-based (Modelo mais simples possivel)
+
+formula0 <- Y ~ 1
+formula1.s <- Y ~ 0 + Sex
+formula1.a <- Y ~ 0 + AgeCat
+formula1.sa <- Y ~ 0 + Sex:AgeCat
+formula1.m <- Y ~ 0 + f(Mun, model = "bym", graph = "RJ.adj", constr = F)
+
+# mod0.freq <- glm( Y ~ 1, family = poisson, offset = log(POP/10^5), data = dadosCHIKRJ)
+# 
+# exp(c(mod0.freq$coefficients, confint(mod0.freq)))
+# 
+# sum( exp(mod0.freq$linear.predictors - log(dadosCHIKRJ$POP / 10^5)) * dadosCHIKRJ$POP)  / sum(dadosCHIKRJ$POP)
+
+quantis <- c(0.025, .975, 0.25, 0.75)
+
+mod0 <- inla( formula = formula0, 
+              quantiles = quantis, 
+              family = "poisson", 
+              E = POP / 10^5, 
+              data = dadosCHIKRJ,
+              control.predictor = list(compute = T),
+              control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0))
+
+mod1.s <- inla( formula = formula1.s, 
+                quantiles = quantis, 
+                family = "poisson", 
+                E = POP / 10^5, 
+                data = dadosCHIKRJ,
+                control.predictor = list(compute = T),
+                control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0))
+
+mod1.a <- inla( formula = formula1.a, 
+                quantiles = quantis, 
+                family = "poisson", 
+                E = POP / 10^5, 
+                data = dadosCHIKRJ,
+                control.predictor = list(compute = T),
+                control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0))
+
+mod1.sa <- inla( formula = formula1.sa,             
+                 quantiles = quantis, 
+                 family = "poisson", 
+                 E = POP / 10^5, 
+                 data = dadosCHIKRJ,
+              control.predictor = list(compute = T),
+              control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0))
+
+
+mod1.m <- inla( formula = formula1.m,             
+                  quantiles = quantis, 
+                family = "poisson", 
+                E = POP / 10^5, 
+                data = dadosCHIKRJ,
+              control.predictor = list(compute = T),
+              control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0))
+
+
+
+# Incidencia global com intervalo
+inc0.glob <- exp(mod0$summary.fixed[,c(1, 3:6)]) %>%
+  mutate(
+    Type = "Geral"
+  )
+
+# Incidencia por sexo com intervalo
+inc0.sex <- exp(mod1.s$summary.fixed[,c(1,3:6)]) %>%
+  mutate(
+    Type = substr(row.names(mod1.s$summary.fixed),4,4)
+    )
+
+# Incidencia por faixa etaria com intervalo
+inc0.faet <- exp(mod1.a$summary.fixed[,c(1,3:6)]) %>%
+  mutate(
+    Type = substr(row.names(mod1.a$summary.fixed),7,nchar(row.names(mod1.a$summary.fixed)))
+  )
+
+# Incidencia por sexo e faixa etaria com intervalo
+inc0.sexfaet <- exp(mod1.sa$summary.fixed[,c(1,3:6)]) %>%
+  mutate(
+    Sexo = as.factor(substr(row.names(mod1.sa$summary.fixed),4,4)),
+    FaixaEtaria = as.factor(substr(row.names(mod1.sa$summary.fixed),12,nchar(row.names(mod1.sa$summary.fixed))))
+  )
+
+# Incidencia por municipio com intervalo
+inc0.mun <- exp(mod1.m$summary.random$Mun[1:92, c(1,3:6) +1]) %>%
+  rowid_to_column(var = "Mun")
+
+```
+
+### Tempo de processamento geral 
+
+```{r, echo=F, results='asis'}
+x <- c(mod0$cpu.used[4],mod1.s$cpu.used[4],mod1.a$cpu.used[4],mod1.sa$cpu.used[4],mod1.m$cpu.used[4])
+names(x) <- c("mod0","mod1.s","mod1.a","mod1.sa","mod1.m")
+```
+
+## Incidências de Chikungunya para o estado do Rio de Janeiro
+
+### Incidência geral 
+
+```{r, echo=F, results='asis'}
+knitr::kable(inc0.glob[,c(6,1:3)], digits = 2)
+```
+
+### Incidência específica por sexo
+
+```{r, echo=F, results='asis'}
+knitr::kable(inc0.sex[,c(6,1:3)], digits = 2)
+```
+
+### Incidência específica por faixa etária
+
+```{r, echo=F, results='asis'}
+knitr::kable(inc0.faet[,c(6,1:3)], digits = 2)
+```
+
+
+
+### Incidência específica por sexo e faixa etária
+
+
+```{r, echo=F}
+pos.dodge <- position_dodge(width = .5)
+
+p <- ggplot(inc0.sexfaet, 
+            aes(y = mean, x = FaixaEtaria, 
+                ymin = `0.25quant`, 
+                ymax = `0.975quant`,
+                color = Sexo)
+            ) +
+  geom_point(position = pos.dodge) +
+  geom_linerange( position = pos.dodge) +
+  geom_linerange(
+    mapping = aes(x = FaixaEtaria, 
+                 ymin = `0.25quant`, 
+                ymax = `0.975quant`,
+                color = Sexo),
+    position = pos.dodge,
+    size=1.2) + 
+  theme_bw( base_size = 14) + 
+  xlab("Faixa Etaria") + 
+  ylab("Incidencia específica por 100 mil") + 
+  coord_flip()
+
+p
+```
+
+
+### Mapa da incidencia específica de Chikungunya por município
+
+```{r, echo=F, results='hide', message=F, warning=F}
+library(sf)
+
+RJ.map.sf.0 <- st_read("../Data/Shapes/rj_municipios/33MUE250GC_SIR.shp") %>% 
+  mutate( COD_MUN = substr(as.character(CD_GEOCMU), start = 1, stop = 6) ) %>% 
+  left_join(CODMUN.tbl, by = "COD_MUN" )
+
+RJ.map.sf <-  RJ.map.sf.0  %>% 
+  left_join( inc0.mun, by = "Mun") %>%
+  mutate(
+    IncidenciaCat = cut(mean, breaks = c(0, 10, 20, 50, 150, 300, 600), 
+                          labels = c("0 - 10", "10 - 20", "20 - 50", "50 - 150", "150 - 300", "300+"))
+  )
+
+# ggplot( RJ.map.sf ) +  
+#   geom_sf(aes(fill = mean))  + theme_bw() + scale_fill_gradient( low = "yellow", high = "red")
+# 
+# ggplot( RJ.map.sf ) +  
+#   geom_sf(aes(fill = "0.025quant"))  + theme_bw() + scale_fill_gradient( low = "yellow", high = "red")
+
+map.1 <- ggplot( RJ.map.sf ) +
+  geom_sf(aes(fill = IncidenciaCat))  + 
+  theme_bw()  + 
+  scale_fill_brewer( palette = "YlOrRd")
+
+map.1
+```
+
+
+
+## Incidências geral e específicas ajustadas (baseadas em modelo)
+
+Seja o seguinte modelo
+
+$$Y_{s,a,m} \sim Pois(\lambda_{s,a,m})$$
+onde 
+$$\log(\lambda_{s,a,m}) \sim 1 + s + a + s:a + \gamma_{m} + offset$$
+na qual $\gamma_m$ é um efeito aleatório espacial, ajustado segundo a soma de um processo CAR intrínseco e um processo gaussiano iid, conhecido por bym. O termo $offset$ é dado por $\log(POP_{s,a,m} \times 10^{-5})$.
+
+Dessa forma, a incidência ajustada é dada pelo exponencial do preditor linear $\widetilde{I}_{s,a,m} = e^{\eta_{s,a,m}}$ do modelo. 
+
+
+```{r}
+formula2 <- Y ~ 1 + Sex*AgeCat + f(Mun, model = "bym", graph = "RJ.adj")
+
+mod2 <- inla( formula = formula2, family = "poisson", E = POP / 10^5, data = dadosCHIKRJ,
+              control.predictor = list(compute = T),
+              control.compute = list(config = T),
+              control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0.01)) #prec.intercept é a priori (nao informativa, o default e zero, resultando em variancia infinita para o Beta)
+```
+
+E a incerteza associada as estimativas de incidência geral e específicas é calculada via aproximação de Monte Carlo usando de amostras da posteriori aproximada do modelo completo via INLA.
+```{r}
+# Gerando amostras da posteriori aproximada via INLA
+mod2.sample <- inla.posterior.sample(n = 1000, result = mod2)
+
+n <- nrow(dadosCHIKRJ)
+
+# gerando amostras da posteriori do INLA
+teste <- sapply(mod2.sample, FUN = function(x) x$latent[1:n])
+
+# Incluindo as variaveis para calcular as incidencias
+teste <- cbind(dadosCHIKRJ[,c(8,3,4,5)], teste )
+
+
+# Preparando a amostra no formato long
+# log da incidencia por sex, agecat, mun e amostra
+testeB <- gather(teste, value = "logInc", key = "Sample", -Mun, -POP, -AgeCat, -Sex)
+```
+
+
+
+## Incidências de Chikungunya para o estado do Rio de Janeiro (ajustadas)
+
+```{r, echo = F}
+## Incidencia geral
+
+Incidencia.Geral.tbl <- testeB %>% 
+  group_by(Sample) %>% 
+  # Para cada amostra calcular incidencia geral
+  summarise( IncGeral = sum(exp(logInc) * POP) / sum(POP)) %>%
+  # Calcular estatisticas a posteriori da Inc geral
+  summarise(
+    Mean = mean(IncGeral),
+    LI = quantile(IncGeral, probs = 0.025),
+    LIb = quantile(IncGeral, probs = .25),
+    LSb = quantile(IncGeral, probs = .75),
+    LS = quantile(IncGeral, probs = 0.975)
+  )
+
+
+## Incidencia específica por sexo
+
+Incidencia.Sex.tbl <- testeB %>% 
+  # Agrupar por Sexo e amostras
+  group_by(Sample, Sex) %>% 
+  # Para cada amostra calcular incidencia especifica
+  summarise( IncSpec = sum(exp(logInc) * POP) / sum(POP)) %>%
+  # Agrupar por Sexo
+  group_by(Sex) %>%
+  # Calcular estatisticas a posteriori da Inc espec.
+  summarise(
+    Mean = mean(IncSpec),
+    LI = quantile(IncSpec, probs = 0.025),
+    LIb = quantile(IncSpec, probs = 0.25),
+    LSb = quantile(IncSpec, probs = 0.75),
+    LS = quantile(IncSpec, probs = 0.975)
+  )
+
+## Incidencia específica por faixa etaria
+
+Incidencia.FaixaEtaria.tbl <- testeB %>% 
+  # Agrupar por Faixa Etaria e amostras
+  group_by(Sample, AgeCat) %>% 
+  # Para cada amostra calcular incidencia especifica
+  summarise( IncSpec = sum(exp(logInc) * POP) / sum(POP)) %>%
+  # Agrupar por Faixa Etaria
+  group_by(AgeCat) %>%
+  # Calcular estatisticas a posteriori da Inc espec.
+  summarise(
+    Mean = mean(IncSpec),
+    LI = quantile(IncSpec, probs = 0.025),
+    LIb = quantile(IncSpec, probs = 0.25),
+    LSb = quantile(IncSpec, probs = 0.75),
+    LS = quantile(IncSpec, probs = 0.975)
+  )
+
+
+## Incidencia específica por sexo E faixa etaria
+Incidencia.SexoFaixaEtaria.tbl <- testeB %>% 
+  # Agrupar por Sexo, Faixa Etaria e amostras
+  group_by(Sample, Sex, AgeCat) %>% 
+  # Para cada amostra calcular incidencia especifica
+  summarise( IncSpec = sum(exp(logInc) * POP) / sum(POP)) %>%
+  # Agrupar por Sexo e Faixa Etaria
+  group_by(Sex, AgeCat) %>%
+  # Calcular estatisticas a posteriori da Inc espec.
+  summarise(
+    Mean = mean(IncSpec),
+    LI = quantile(IncSpec, probs = 0.025),
+    LIb = quantile(IncSpec, probs = 0.25),
+    LSb = quantile(IncSpec, probs = 0.75),
+    LS = quantile(IncSpec, probs = 0.975)
+  )
+
+## Incidencia específica por municipio
+
+## Incidencia específica por sexo E faixa etaria
+Incidencia.Mun.tbl <- testeB %>% 
+  # Agrupar por Municipio e amostras
+  group_by(Sample, Mun) %>% 
+  # Para cada amostra calcular incidencia especifica
+  summarise( IncSpec = sum(exp(logInc) * POP) / sum(POP)) %>%
+  # Agrupar por Municipio
+  group_by(Mun) %>%
+  # Calcular estatisticas a posteriori da Inc espec.
+  summarise(
+    Mean = mean(IncSpec),
+    LI = quantile(IncSpec, probs = 0.025),
+    LIb = quantile(IncSpec, probs = 0.25),
+    LSb = quantile(IncSpec, probs = 0.75),
+    LS = quantile(IncSpec, probs = 0.975)
+  )
+```
+
+
+
+### Incidência geral ajustada
+
+```{r, echo=F, results='asis'}
+knitr::kable(Incidencia.Geral.tbl[,c(1,2,5)], digits = 2)
+```
+
+### Incidência específica por sexo
+
+```{r, echo=F, results='asis'}
+knitr::kable(Incidencia.Sex.tbl[,c(1,2,3,6)], digits = 2)
+```
+
+### Incidência específica por faixa etária
+
+```{r, echo=F, results='asis'}
+knitr::kable(Incidencia.FaixaEtaria.tbl[,c(1,2,3,6)], digits = 2)
+```
+
+
+
+### Incidência específica por sexo e faixa etária
+
+
+```{r, echo=F}
+pos.dodge <- position_dodge(width = .5)
+
+p2 <- ggplot(Incidencia.SexoFaixaEtaria.tbl, 
+            aes(y = Mean, x = AgeCat, 
+                ymin = LI, 
+                ymax = LS,
+                color = Sex)
+            ) +
+  geom_point(position = pos.dodge) +
+  geom_linerange( position = pos.dodge) +
+  geom_linerange(
+    mapping = aes(x = AgeCat, 
+                ymin = LIb, 
+                ymax = LSb,
+                color = Sex),
+    position = pos.dodge,
+    size=1.2) + 
+  theme_bw( base_size = 14) + 
+  xlab("Faixa Etaria") + 
+  ylab("Incidencia específica ajustada por 100 mil") + 
+  coord_flip()
+
+p2
+```
+
+### Mapa da incidencia específica de Chikungunya por município
+
+```{r, echo=F}
+
+RJ.map.sf.2 <-  RJ.map.sf.0  %>% 
+  left_join( Incidencia.Mun.tbl, by = "Mun") %>%
+  mutate(
+    IncidenciaCat = cut(Mean, 
+                        breaks = c(0, 10, 20, 50, 150, 300, 600),
+                        labels = c("0 - 10", "10 - 20", "20 - 50", "50 - 150", "150 - 300", "300+"))
+  )
+
+# ggplot( RJ.map.sf.2 ) +  
+#   geom_sf(aes(fill = Mean))  + theme_bw() + scale_fill_gradient( low = "yellow", high = "red")
+# 
+# ggplot( RJ.map.sf.2 ) +  
+#   geom_sf(aes(fill = LI))  + theme_bw() + scale_fill_gradient( low = "yellow", high = "red")
+
+map.2 <- ggplot( RJ.map.sf.2 ) +
+  geom_sf(aes(fill = IncidenciaCat))  + theme_bw()  + scale_fill_brewer( palette = "YlOrRd")
+
+map.2
+head(population)
+```
+
+```{r}
+library(magrittr)
+library(dplyr)
+library(ggplot2)
+View(Incidencia.SexoFaixaEtaria.tbl)
+population <- Incidencia.SexoFaixaEtaria.tbl[,1:3]
+
+population %<>% 
+  mutate(Mean = ifelse(Sex == "M", Mean*-1, Mean))
+
+png(filename = "~/R/pyramid.png", width = 900, height = 1000, type = "cairo")
+
+aaa <- ggplot(population, aes(x = AgeCat, color = Sex))+
+  geom_linerange(data = population[population$Sex=="M",], 
+                 aes(ymin = -0.3, ymax = -0.3+Mean), size = 3.5, alpha = 0.8)+
+  geom_linerange(data = population[population$Sex=="F",], 
+                 aes(ymin = 0.3, ymax = 0.3+Mean), size = 3.5, alpha = 0.8)+
+  geom_label(aes(x = AgeCat, y = 0, label = AgeCat, family = "Ubuntu Condensed"), 
+         inherit.aes = F,
+         size = 3.5, label.padding = unit(0.0, "lines"), label.size = 0,
+         label.r = unit(0.0, "lines"), fill = "#EFF2F4", alpha = 0.9, color = "#5D646F")+
+  # scale_y_continuous(breaks = c(c(-2, -1.5, -1, -0.5, 0) + -0.3, c(0, 0.5, 1, 1.5, 2)+0.3),
+  #                labels = c("2", "1.5", "1", "0.5", "0", "0", "0.5", "1", "1.5", "2"))+
+  coord_flip()+
+labs(title = "Pirâmide etária para incidência de Chikungunya",
+   subtitle = "Rio de Janeiro - 2016",
+   caption = "blabla")+
+  scale_color_manual(name = "", values = c(M = "#3E606F", F = "#8C3F4D"),
+                 labels = c("Homens", "Mulheres"))+
+  theme_minimal(base_family = "Ubuntu Condensed")+
+theme(text = element_text(color = "#3A3F4A"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(linetype = "dotted", size = 0.3, color = "#3A3F4A"),
+    axis.title = element_blank(),
+    plot.title = element_text(face = "bold", size = 36, margin = margin(b = 10), hjust = 0.030),
+    plot.subtitle = element_text(size = 16, margin = margin(b = 20), hjust = 0.030),
+    plot.caption = element_text(size = 14, margin = margin(b = 10, t = 50), color = "#5D646F"),
+    axis.text.x = element_text(size = 12, color = "#5D646F"),
+    axis.text.y = element_blank(),
+    strip.text = element_text(color = "#5D646F", size = 18, face = "bold", hjust = 0.030),
+    plot.background = element_rect(fill = "#EFF2F4"),
+    plot.margin = unit(c(2, 2, 2, 2), "cm"),
+    legend.position = "top",
+    # legend.margin  = unit(0.1, "lines"),
+    # legend.text  = element_text(family = "Ubuntu Condensed", size = 14),
+    legend.text.align = 0)
+
+dev.off()
+```
+
